@@ -24,6 +24,7 @@ static const char *(*get_realpath_sym)(SoInfo *) = NULL;
 static void (*soinfo_free)(SoInfo *) = NULL;
 static SoInfo *(*find_containing_library)(const void *p) = NULL;
 static void (*purge_unused_memory)(void) = NULL;
+struct link_map *r_debug_tail = NULL;
 
 static inline const char *get_path(SoInfo *self) {
   if (get_realpath_sym)
@@ -150,6 +151,17 @@ static bool solist_init() {
 
   LOGD("%p is purge_unused_memory", (void *)purge_unused_memory);
 
+  r_debug_tail = (struct link_map *)getSymbValueByPrefix(linker, "__dl__ZL12r_debug_tail");
+  if (r_debug_tail == NULL) {
+    LOGE("Failed to find r_debug_tail __dl__ZL10r_debug_tail");
+
+    ElfImg_destroy(linker);
+
+    somain = NULL;
+
+    return false;
+  }
+
   g_module_load_counter = (size_t *)getSymbAddress(linker, "__dl__ZL21g_module_load_counter");
   if (g_module_load_counter != NULL) LOGD("found symbol g_module_load_counter");
 
@@ -171,6 +183,58 @@ static bool solist_init() {
   ElfImg_destroy(linker);
 
   return true;
+}
+
+/* INFO: This is an AOSP function to remove a link map from
+           the link map list.
+
+   SOURCES:
+    - https://android.googlesource.com/platform/bionic/+/refs/heads/android15-release/linker/linker_gdb_support.cpp#63
+*/
+static void remove_link_map_from_debug_map(struct link_map *map) {
+  if (r_debug_tail == map) {
+    r_debug_tail = map->l_prev;
+  }
+
+  if (map->l_prev) {
+    map->l_prev->l_next = map->l_next;
+  }
+
+  if (map->l_next) {
+    map->l_next->l_prev = map->l_prev;
+  }
+}
+
+static struct link_map *find_link_map(SoInfo *si) {
+  const char *path = get_path(si);
+  if (path == NULL) {
+    LOGE("Failed to get path for SoInfo %p", (void *)si);
+
+    return NULL;
+  }
+
+  LOGD("Searching for link_map for %s", path);
+
+  struct link_map *map = r_debug_tail;
+  while (map) {
+    /* INFO: l_name uses the same pointer as realpath function of SoInfo, allowing us
+               to directly compare the pointers instead of the strings.
+
+       SOURCES:
+        - https://android.googlesource.com/platform/bionic/+/refs/heads/android15-release/linker/linker.cpp#283
+    */
+    if (map->l_name && (uintptr_t)map->l_name == (uintptr_t)path) {
+      LOGD("Found link_map for %s: %p", path, (void *)map);
+
+      return map;
+    }
+
+    map = map->l_next;
+  }
+
+  LOGE("Failed to find link_map for %s", path);
+
+  return NULL;
 }
 
 /* INFO: find_containing_library returns the SoInfo for the library that contains
@@ -219,11 +283,24 @@ bool solist_drop_so_path(void *lib_memory, bool unload) {
   } else if (!unload) {
     LOGD("Not unloading so path for %s, only dropping it", path);
 
-    /* TODO: call notify_gdb_of_unload(found); (it is static) to avoid leaving traces in
-               r_debug_tail.
-       SOURCES:
-        - https://android.googlesource.com/platform/bionic/+/refs/heads/main/linker/linker_gdb_support.cpp#94
+    /* 
+       INFO: If the link map is not removed from the list, it gets inconsistent, resulting
+               in a loop when listing through it, which can be detected. To fix that, we
+               can remove the map, like expected.
+
+             We cannot use the notify_gdb_of_unload function as it is static, and not available
+               in all linker binaries.
     */
+    struct link_map *map = find_link_map(found);
+    if (!map) {
+      LOGE("Failed to find link map for %s", path);
+
+      pdg_protect();
+
+      return false;
+    }
+
+    remove_link_map_from_debug_map(map);
     /* INFO: unregister_soinfo_tls cannot be used since module might use JNI which may
                require TLS, so we cannot remove it. */
     soinfo_free(found);
