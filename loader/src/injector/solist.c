@@ -23,7 +23,6 @@
 static const char *(*get_realpath_sym)(SoInfo *) = NULL;
 static void (*soinfo_free)(SoInfo *) = NULL;
 static SoInfo *(*find_containing_library)(const void *p) = NULL;
-static void (*purge_unused_memory)(void) = NULL;
 struct link_map *r_debug_tail = NULL;
 
 static inline const char *get_path(SoInfo *self) {
@@ -138,19 +137,6 @@ static bool solist_init() {
 
   LOGD("%p is find_containing_library", (void *)find_containing_library);
 
-  purge_unused_memory = (void (*)())getSymbAddress(linker, "__dl__Z19purge_unused_memoryv");
-  if (purge_unused_memory == NULL) {
-    LOGE("Failed to find purge_unused_memory __dl__Z19purge_unused_memoryv");
-
-    ElfImg_destroy(linker);
-
-    somain = NULL;
-
-    return false;
-  }
-
-  LOGD("%p is purge_unused_memory", (void *)purge_unused_memory);
-
   r_debug_tail = (struct link_map *)getSymbValueByPrefix(linker, "__dl__ZL12r_debug_tail");
   if (r_debug_tail == NULL) {
     LOGE("Failed to find r_debug_tail __dl__ZL10r_debug_tail");
@@ -250,8 +236,6 @@ bool solist_drop_so_path(void *lib_memory, bool unload) {
   if (found == NULL) {
     LOGD("Could not find containing library for %p", lib_memory);
 
-    purge_unused_memory();
-
     return false;
   }
 
@@ -310,13 +294,8 @@ bool solist_drop_so_path(void *lib_memory, bool unload) {
 
   LOGD("Successfully hidden soinfo traces for %s", path);
 
-  /* INFO: Avoid leaks by ensuring the freed places are munmapped */
-  purge_unused_memory();
-
-  LOGD("Purged unused memory successfully");
-
   /* INFO: Let's avoid trouble regarding detections */
-  memset(path, strlen(path), 0);
+  memset(path, 0, sizeof(path));
 
   return true;
 }
