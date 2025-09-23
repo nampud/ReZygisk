@@ -20,8 +20,11 @@
   size_t solist_realpath_offset = 0x174;
 #endif
 
+size_t solist_fini_array_size_offset = 0x0;
+size_t solist_fini_offset = 0x0;
+
 static const char *(*get_realpath_sym)(SoInfo *) = NULL;
-static void (*soinfo_free)(SoInfo *) = NULL;
+static void (*soinfo_unload)(SoInfo *) = NULL;
 static SoInfo *(*find_containing_library)(const void *p) = NULL;
 struct link_map *r_debug_tail = NULL;
 
@@ -59,6 +62,8 @@ static SoInfo *somain = NULL;
 
 static size_t *g_module_load_counter = NULL;
 static size_t *g_module_unload_counter = NULL;
+
+static struct link_map *find_link_map(SoInfo *si);
 
 static bool solist_init() {
   #ifdef __LP64__
@@ -102,37 +107,25 @@ static bool solist_init() {
   if (get_realpath_sym == NULL) {
     LOGE("Failed to find get_realpath __dl__ZNK6soinfo12get_realpathEv");
 
-    ElfImg_destroy(linker);
-
-    somain = NULL;
-
-    return false;
+    goto solist_init_error;
   }
 
   LOGD("%p is get_realpath", (void *)get_realpath_sym);
 
-  soinfo_free = (void (*)(SoInfo *))getSymbAddressByPrefix(linker, "__dl__ZL11soinfo_freeP6soinfo");
-  if (soinfo_free == NULL) {
-    LOGE("Failed to find soinfo_free __dl__ZL11soinfo_freeP6soinfo*");
+  soinfo_unload = (void (*)(SoInfo *))getSymbAddressByPrefix(linker, "__dl__ZL13soinfo_unloadP6soinfo");
+  if (soinfo_unload == NULL) {
+    LOGE("Failed to find soinfo_unload __dl__ZL13soinfo_unloadP6soinfo*");
 
-    ElfImg_destroy(linker);
-
-    somain = NULL;
-
-    return false;
+    goto solist_init_error;
   }
 
-  LOGD("%p is soinfo_free", (void *)soinfo_free);
+  LOGD("%p is soinfo_unload", (void *)soinfo_unload);
 
   find_containing_library = (SoInfo *(*)(const void *))getSymbAddress(linker, "__dl__Z23find_containing_libraryPKv");
   if (find_containing_library == NULL) {
     LOGE("Failed to find find_containing_library __dl__Z23find_containing_libraryPKv");
 
-    ElfImg_destroy(linker);
-
-    somain = NULL;
-
-    return false;
+    goto solist_init_error;
   }
 
   LOGD("%p is find_containing_library", (void *)find_containing_library);
@@ -141,12 +134,26 @@ static bool solist_init() {
   if (r_debug_tail == NULL) {
     LOGE("Failed to find r_debug_tail __dl__ZL10r_debug_tail");
 
-    ElfImg_destroy(linker);
-
-    somain = NULL;
-
-    return false;
+    goto solist_init_error;
   }
+
+  SoInfo *solinker = (SoInfo *)getSymbValueByPrefix(linker, "__dl__ZL8solinker");
+  if (solinker == NULL) {
+    LOGE("Failed to find solinker __dl__ZL8solinker");
+
+    goto solist_init_error;
+  }
+
+  LOGD("%p is solinker", (void *)solinker);
+
+  struct link_map *solinker_map = find_link_map(solinker);
+  if (solinker_map == NULL) {
+    LOGE("Failed to find link_map for solinker");
+
+    goto solist_init_error;
+  }
+
+  LOGD("%p is solinker_map", (void *)solinker_map);
 
   g_module_load_counter = (size_t *)getSymbAddress(linker, "__dl__ZL21g_module_load_counter");
   if (g_module_load_counter != NULL) LOGD("found symbol g_module_load_counter");
@@ -154,41 +161,47 @@ static bool solist_init() {
   g_module_unload_counter = (size_t *)getSymbAddress(linker, "__dl__ZL23g_module_unload_counter");
   if (g_module_unload_counter != NULL) LOGD("found symbol g_module_unload_counter");
 
+  ElfImg_destroy(linker);
+
   for (size_t i = 0; i < 1024 / sizeof(void *); i++) {
     size_t possible_size_of_somain = *(size_t *)((uintptr_t)somain + i * sizeof(void *));
 
-    if (possible_size_of_somain < 0x100000 && possible_size_of_somain > 0x100) {
+    if (solist_size_offset == 0 && possible_size_of_somain < 0x100000 && possible_size_of_somain > 0x100) {
       solist_size_offset = i * sizeof(void *);
 
       LOGD("solist_size_offset is %zu * %zu = %p", i, sizeof(void *), (void *)solist_size_offset);
+    }
+
+    struct link_map *possible_link_map_head = (struct link_map *)((uintptr_t)solinker + i * sizeof(void *));
+    if (possible_link_map_head->l_name == solinker_map->l_name) {
+
+      #ifdef __arm__
+        /* INFO: For arm32, ARM_exidx and ARM_exidx_count is defined between them. */
+        solist_fini_array_size_offset = (i - 6) * sizeof(void *);
+        solist_fini_offset = (i - 5) * sizeof(void *);
+
+        LOGD("solist_fini_array_size_offset is %zu * %zu = %p", (i - 6), sizeof(void *), (void *)solist_fini_array_size_offset);
+        LOGD("solist_fini_offset is %zu * %zu = %p", (i - 4), sizeof(void *), (void *)solist_fini_offset);
+      #else
+        solist_fini_array_size_offset = (i - 4) * sizeof(void *);
+        solist_fini_offset = (i - 2) * sizeof(void *);
+
+        LOGD("solist_fini_array_size_offset is %zu * %zu = %p", (i - 4), sizeof(void *), (void *)solist_fini_array_size_offset);
+        LOGD("solist_fini_offset is %zu * %zu = %p", (i - 2), sizeof(void *), (void *)solist_fini_offset);
+      #endif
 
       break;
     }
   }
 
-  ElfImg_destroy(linker);
-
   return true;
-}
 
-/* INFO: This is an AOSP function to remove a link map from
-           the link map list.
+  solist_init_error:
+    ElfImg_destroy(linker);
 
-   SOURCES:
-    - https://android.googlesource.com/platform/bionic/+/refs/heads/android15-release/linker/linker_gdb_support.cpp#63
-*/
-static void remove_link_map_from_debug_map(struct link_map *map) {
-  if (r_debug_tail == map) {
-    r_debug_tail = map->l_prev;
-  }
+    somain = NULL;
 
-  if (map->l_prev) {
-    map->l_prev->l_next = map->l_next;
-  }
-
-  if (map->l_next) {
-    map->l_next->l_prev = map->l_prev;
-  }
+    return false;
 }
 
 static struct link_map *find_link_map(SoInfo *si) {
@@ -209,13 +222,13 @@ static struct link_map *find_link_map(SoInfo *si) {
        SOURCES:
         - https://android.googlesource.com/platform/bionic/+/refs/heads/android15-release/linker/linker.cpp#283
     */
-    if (map->l_name && (uintptr_t)map->l_name == (uintptr_t)path) {
+    if ((uintptr_t)map->l_name == (uintptr_t)path) {
       LOGD("Found link_map for %s: %p", path, (void *)map);
 
       return map;
     }
 
-    map = map->l_next;
+    map = map->l_prev;
   }
 
   LOGE("Failed to find link_map for %s", path);
@@ -275,19 +288,17 @@ bool solist_drop_so_path(void *lib_memory, bool unload) {
              We cannot use the notify_gdb_of_unload function as it is static, and not available
                in all linker binaries.
     */
-    struct link_map *map = find_link_map(found);
-    if (!map) {
-      LOGE("Failed to find link map for %s", path);
-
-      pdg_protect();
-
-      return false;
-    }
-
-    remove_link_map_from_debug_map(map);
     /* INFO: unregister_soinfo_tls cannot be used since module might use JNI which may
                require TLS, so we cannot remove it. */
-    soinfo_free(found);
+    size_t tmp_fini_array_size = *(size_t *)((uintptr_t)found + solist_fini_array_size_offset);
+    void **tmp_fini_array = *(void ***)((uintptr_t)found + solist_fini_offset);
+
+    LOGD("Bypassing call to %zu destructors and deconstructor %p", tmp_fini_array_size, tmp_fini_array);
+
+    *(size_t *)((uintptr_t)found + solist_fini_array_size_offset) = 0;
+    *(void ***)((uintptr_t)found + solist_fini_offset) = NULL;
+
+    soinfo_unload(found);
 
     pdg_protect();
   }
