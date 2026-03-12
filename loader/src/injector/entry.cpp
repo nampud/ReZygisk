@@ -25,9 +25,7 @@ void entry(void* addr, size_t size, char **argv, char **envp) {
 
     LOGD("start plt hooking");
     hook_functions();
-
-    solist_drop_so_path(addr, true);
-    solist_reset_counters(1, 1);
+    solist_init();
 
     send_seccomp_event();
 

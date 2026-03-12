@@ -14,6 +14,8 @@ struct pdg {
   void *(*dtor)();
 };
 
+bool solist_init();
+
 /* 
   INFO: When dlopen'ing a library, the system will save information of the
           opened library so a structure called soinfo, which contains another

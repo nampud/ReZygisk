@@ -69,7 +69,9 @@ static size_t *g_module_unload_counter = NULL;
 
 static struct link_map *find_link_map(SoInfo *si);
 
-static bool solist_init() {
+bool solist_init() {
+  if (somain != NULL) return true;
+
   #ifdef __LP64__
     ElfImg *linker = ElfImg_create("/system/bin/linker64", NULL);
   #else
