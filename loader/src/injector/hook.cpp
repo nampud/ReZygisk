@@ -1393,9 +1393,6 @@ static void unhook_functions() {
     mountinfo_buf.unmap();
     mountinfo_prev.unmap();
     rules_unload();
-
-    solist_drop_so_path(start_addr, true);
-    solist_reset_counters(1, 1);
 }
 
 extern "C" int __cxa_atexit(void (*)(void*), void*, void*) {

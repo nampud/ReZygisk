@@ -23,6 +23,9 @@ void entry(void* addr, size_t size, char **argv, char **envp) {
 
     clean_mounts(argv, envp);
 
+    solist_drop_so_path(start_addr, true);
+    solist_reset_counters(1, 1);
+
     LOGD("start plt hooking");
     hook_functions();
     solist_init();
